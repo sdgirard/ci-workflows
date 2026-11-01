@@ -1,0 +1,163 @@
+name: Harbor build and push
+
+# Reusable: version from VERSION + git tags -> multi-arch build -> push to Harbor -> git tag.
+# Caller grants `contents: write` and passes the Harbor robot secrets. See README.md.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name inside the Harbor project (e.g. ofx-ingest)
+        required: true
+        type: string
+      harbor-project:
+        description: Harbor project (e.g. ofx-ingest, todo-app)
+        required: true
+        type: string
+      version-prefix:
+        description: Git tag prefix; tags look like <prefix>-X.Y.Z. One per independently versioned image.
+        required: true
+        type: string
+      harbor-registry:
+        type: string
+        default: docker.thecameraeye.ca
+      dockerfile:
+        type: string
+        default: Dockerfile
+      context:
+        type: string
+        default: .
+      platforms:
+        type: string
+        default: linux/amd64,linux/arm64
+      version-file:
+        description: File holding Major.Minor ("0.1"); hand-bumped, patch is derived from tags
+        type: string
+        default: VERSION
+      build-args:
+        description: Extra build args, one KEY=value per line (APP_VERSION/APP_COMMIT_SHA/APP_BUILD_DATE are always passed)
+        type: string
+        default: ''
+      legacy-unprefixed-tags:
+        description: If no <prefix>-X.Y.* tag exists, continue from an unprefixed X.Y.* tag instead of starting at .0
+        type: boolean
+        default: false
+    secrets:
+      HARBOR_ROBOT_USERNAME:
+        required: true
+      HARBOR_ROBOT_TOKEN:
+        required: true
+    outputs:
+      version:
+        description: Published image version (X.Y.Z)
+        value: ${{ jobs.build-and-push.outputs.version }}
+      git_tag:
+        description: Git tag pushed for this release (<prefix>-X.Y.Z)
+        value: ${{ jobs.build-and-push.outputs.git_tag }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release git tag
+    # Two quick pushes to main would otherwise compute the same version and the second
+    # would overwrite the first's image tag before failing on the git tag.
+    concurrency:
+      group: harbor-release-${{ github.repository }}-${{ inputs.version-prefix }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      git_tag: ${{ steps.version.outputs.git_tag }}
+    env:
+      IMAGE_REF: ${{ inputs.harbor-registry }}/${{ inputs.harbor-project }}/${{ inputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags to find the latest version
+
+      - name: Generate version
+        id: version
+        env:
+          PREFIX: ${{ inputs.version-prefix }}
+          VERSION_FILE: ${{ inputs.version-file }}
+          LEGACY: ${{ inputs.legacy-unprefixed-tags }}
+        run: |
+          set -eu
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "::error::$VERSION_FILE not found; add one containing Major.Minor, e.g. 0.1"
+            exit 1
+          fi
+          MAJOR_MINOR=$(tr -d '\n\r ' < "$VERSION_FILE")
+          if ! echo "$MAJOR_MINOR" | grep -qE '^[0-9]+\.[0-9]+$'; then
+            echo "::error file=$VERSION_FILE::must contain 'X.Y' (e.g. 0.1), got '$MAJOR_MINOR'"
+            exit 1
+          fi
+
+          PATCH=0
+          LATEST=$(git tag -l "${PREFIX}-${MAJOR_MINOR}.*" --sort=-version:refname | head -n 1)
+          if [ -n "$LATEST" ]; then
+            PATCH=$(( ${LATEST##*.} + 1 ))
+            echo "Latest tag $LATEST"
+          fi
+          if [ -z "$LATEST" ] && [ "$LEGACY" = "true" ]; then
+            LEGACY_TAG=$(git tag -l "${MAJOR_MINOR}.*" --sort=-version:refname | head -n 1)
+            if [ -n "$LEGACY_TAG" ]; then
+              PATCH=$(( ${LEGACY_TAG##*.} + 1 ))
+              echo "No ${PREFIX}- tag yet; continuing from legacy tag $LEGACY_TAG"
+            fi
+          fi
+
+          VERSION="${MAJOR_MINOR}.${PATCH}"
+          {
+            echo "version=$VERSION"
+            echo "git_tag=${PREFIX}-${VERSION}"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+          echo "### ${IMAGE_REF}:${VERSION} (git tag ${PREFIX}-${VERSION})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.harbor-registry }}
+          username: ${{ secrets.HARBOR_ROBOT_USERNAME }}
+          password: ${{ secrets.HARBOR_ROBOT_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            APP_COMMIT_SHA=${{ github.sha }}
+            APP_BUILD_DATE=${{ steps.version.outputs.date }}
+            ${{ inputs.build-args }}
+          tags: |
+            ${{ env.IMAGE_REF }}:latest
+            ${{ env.IMAGE_REF }}:${{ github.sha }}
+            ${{ env.IMAGE_REF }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}
+
+      - name: Create and push git tag
+        env:
+          GIT_TAG: ${{ steps.version.outputs.git_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag -a "$GIT_TAG" -m "Release $GIT_TAG" -m "Commit: $GITHUB_SHA" -m "Workflow run: $RUN_URL"
+          git push origin "$GIT_TAG"
